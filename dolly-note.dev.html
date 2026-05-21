@@ -1,0 +1,2274 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="theme-color" content="#f2f2f7" />
+    <title>DollyNote</title>
+    <meta property="og:title" content="DollyNote: Minimalist Whiteboard" />
+    <meta
+      property="og:description"
+      content="A minimalist, high-performance digital whiteboard for the web. Supports infinite canvas and image export."
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Lora:ital@0;1&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.4.4/lz-string.min.js"></script>
+    <script type="module" crossorigin>
+      const ensureModulePreloadSupport = () => {
+        const relList = document.createElement("link").relList;
+
+        if (relList && relList.supports && relList.supports("modulepreload")) {
+          return;
+        }
+
+        const preloadLink = (link) => {
+          if (link.__modulePreloadHandled) {
+            return;
+          }
+
+          link.__modulePreloadHandled = true;
+
+          const fetchOptions = {};
+          if (link.integrity) {
+            fetchOptions.integrity = link.integrity;
+          }
+          if (link.referrerPolicy) {
+            fetchOptions.referrerPolicy = link.referrerPolicy;
+          }
+
+          if (link.crossOrigin === "use-credentials") {
+            fetchOptions.credentials = "include";
+          } else if (link.crossOrigin === "anonymous") {
+            fetchOptions.credentials = "omit";
+          } else {
+            fetchOptions.credentials = "same-origin";
+          }
+
+          fetch(link.href, fetchOptions);
+        };
+
+        document
+          .querySelectorAll('link[rel="modulepreload"]')
+          .forEach(preloadLink);
+
+        new MutationObserver((mutations) => {
+          for (const mutation of mutations) {
+            if (mutation.type !== "childList") {
+              continue;
+            }
+
+            for (const node of mutation.addedNodes) {
+              if (node.tagName === "LINK" && node.rel === "modulepreload") {
+                preloadLink(node);
+              }
+            }
+          }
+        }).observe(document, { childList: true, subtree: true });
+      };
+
+      ensureModulePreloadSupport();
+
+      const getElement = (id) => document.getElementById(id);
+
+      const baseCanvas = getElement("base");
+      const liveCanvas = getElement("live");
+      const cursorCanvas = getElement("cur");
+      const textInput = getElement("ti");
+
+      const baseContext = baseCanvas.getContext("2d");
+      const liveContext = liveCanvas.getContext("2d");
+      const cursorContext = cursorCanvas.getContext("2d");
+
+      const zoomHud = getElement("zoom-hud");
+      const toast = getElement("toast");
+      const undoButton = getElement("btn-undo");
+      const redoButton = getElement("btn-redo");
+
+      const palette = [
+        "#363028",
+        "#C9A89A",
+        "#8FA89A",
+        "#8A9BAE",
+        "#C4B49A",
+        "#A898AE",
+      ];
+      const strokeWidths = [2, 6, 16];
+      const eraserWidths = [28, 60, 110];
+      const textSizes = [22, 36, 60];
+      const simplifyThresholds = [1.5, 3, 6];
+      const deviceScale = Math.min(window.devicePixelRatio || 1, 2);
+
+      const viewState = { x: 0, y: 0, scale: 1 };
+
+      let activeTool = "pen";
+      let activeColorIndex = 0;
+      let activeWidthIndex = 0;
+
+      let strokes = [];
+      let historySnapshots = [[]];
+      let historyIndex = 0;
+
+      let isDrawing = false;
+      let activeStrokePoints = [];
+
+      let isSpacePanning = false;
+      let isDraggingCanvas = false;
+      let isMiddleMousePanning = false;
+
+      let panStartPointer = null;
+      let panStartView = null;
+
+      let pendingBaseRedraw = null;
+      let hoverClientX = -999;
+      let hoverClientY = -999;
+
+      const activePointers = new Map();
+      let drawingPointerId = -1;
+      let pinchGesture = null;
+
+      let isCommittingText = false;
+      let toastTimerId;
+
+      const resizeCanvases = () => {
+        const viewportWidth = innerWidth;
+        const viewportHeight = innerHeight;
+
+        for (const canvas of [baseCanvas, liveCanvas, cursorCanvas]) {
+          canvas.width = Math.round(viewportWidth * deviceScale);
+          canvas.height = Math.round(viewportHeight * deviceScale);
+          canvas.style.width = viewportWidth + "px";
+          canvas.style.height = viewportHeight + "px";
+        }
+
+        scheduleBaseRedraw();
+        drawCursorOverlay(hoverClientX, hoverClientY);
+      };
+
+      window.addEventListener("resize", resizeCanvases);
+
+      const clientToWorld = (clientX, clientY) => ({
+        x: (clientX - viewState.x) / viewState.scale,
+        y: (clientY - viewState.y) / viewState.scale,
+      });
+
+      const applyViewTransform = (context) => {
+        context.setTransform(
+          viewState.scale * deviceScale,
+          0,
+          0,
+          viewState.scale * deviceScale,
+          viewState.x * deviceScale,
+          viewState.y * deviceScale,
+        );
+      };
+
+      const updateZoomHud = () => {
+        zoomHud.textContent = Math.round(viewState.scale * 100) + "%";
+      };
+
+      const zoomAroundPoint = (scaleMultiplier, clientX, clientY) => {
+        const nextScale = Math.max(
+          0.05,
+          Math.min(20, viewState.scale * scaleMultiplier),
+        );
+        const scaleRatio = nextScale / viewState.scale;
+
+        viewState.x = clientX - (clientX - viewState.x) * scaleRatio;
+        viewState.y = clientY - (clientY - viewState.y) * scaleRatio;
+        viewState.scale = nextScale;
+
+        updateZoomHud();
+      };
+
+      const drawStroke = (context, stroke) => {
+        context.save();
+
+        if (stroke.type === "text") {
+          context.fillStyle = stroke.color;
+          context.font = `${stroke.fs}px 'Lora',Georgia,serif`;
+          stroke.text.split("\n").forEach((line, lineIndex) => {
+            context.fillText(
+              line,
+              stroke.x,
+              stroke.y + lineIndex * stroke.fs * 1.35,
+            );
+          });
+          context.restore();
+          return;
+        }
+
+        if (stroke.type === "circle") {
+          context.strokeStyle = stroke.color;
+          context.lineWidth = stroke.w;
+          context.lineCap = "round";
+          context.beginPath();
+          context.arc(stroke.cx, stroke.cy, stroke.r, 0, Math.PI * 2);
+          context.stroke();
+          context.restore();
+          return;
+        }
+
+        context.strokeStyle = stroke.type === "eraser" ? "#fff" : stroke.color;
+        context.fillStyle = stroke.type === "eraser" ? "#fff" : stroke.color;
+        context.lineWidth = stroke.w;
+        context.lineCap = "round";
+        context.lineJoin = "round";
+
+        const points = stroke.pts;
+        if (!points?.length) {
+          context.restore();
+          return;
+        }
+
+        if (points.length === 1) {
+          context.beginPath();
+          context.arc(points[0].x, points[0].y, stroke.w / 2, 0, Math.PI * 2);
+          context.fill();
+          context.restore();
+          return;
+        }
+
+        context.beginPath();
+        context.moveTo(points[0].x, points[0].y);
+
+        for (let index = 1; index < points.length - 1; index++) {
+          const currentPoint = points[index];
+          const nextPoint = points[index + 1];
+          context.quadraticCurveTo(
+            currentPoint.x,
+            currentPoint.y,
+            (currentPoint.x + nextPoint.x) / 2,
+            (currentPoint.y + nextPoint.y) / 2,
+          );
+        }
+
+        const lastPoint = points[points.length - 1];
+        context.lineTo(lastPoint.x, lastPoint.y);
+        context.stroke();
+        context.restore();
+      };
+
+      const drawGrid = () => {
+        const worldViewportWidth = baseCanvas.width / deviceScale;
+        const worldViewportHeight = baseCanvas.height / deviceScale;
+
+        let spacing = 32;
+        while (spacing * viewState.scale < 16) {
+          spacing *= 4;
+        }
+        while (spacing * viewState.scale > 64) {
+          spacing /= 2;
+        }
+
+        const minWorldX = -viewState.x / viewState.scale;
+        const minWorldY = -viewState.y / viewState.scale;
+        const maxWorldX = (worldViewportWidth - viewState.x) / viewState.scale;
+        const maxWorldY = (worldViewportHeight - viewState.y) / viewState.scale;
+
+        const startGridX = Math.floor(minWorldX / spacing) * spacing;
+        const startGridY = Math.floor(minWorldY / spacing) * spacing;
+        const markerRadius = 1 / viewState.scale;
+
+        baseContext.fillStyle = "rgba(0,0,0,.08)";
+        baseContext.beginPath();
+
+        for (
+          let gridX = startGridX;
+          gridX <= maxWorldX + spacing;
+          gridX += spacing
+        ) {
+          for (
+            let gridY = startGridY;
+            gridY <= maxWorldY + spacing;
+            gridY += spacing
+          ) {
+            baseContext.rect(
+              gridX - markerRadius,
+              gridY - markerRadius,
+              markerRadius * 2,
+              markerRadius * 2,
+            );
+          }
+        }
+
+        baseContext.fill();
+      };
+
+      const redrawBaseCanvas = () => {
+        baseContext.setTransform(1, 0, 0, 1, 0, 0);
+        baseContext.fillStyle = "#fff";
+        baseContext.fillRect(0, 0, baseCanvas.width, baseCanvas.height);
+
+        applyViewTransform(baseContext);
+        drawGrid();
+
+        for (const stroke of strokes) {
+          drawStroke(baseContext, stroke);
+        }
+      };
+
+      const scheduleBaseRedraw = () => {
+        if (pendingBaseRedraw) {
+          return;
+        }
+
+        pendingBaseRedraw = requestAnimationFrame(() => {
+          pendingBaseRedraw = null;
+          redrawBaseCanvas();
+        });
+      };
+
+      const drawCursorOverlay = (clientX, clientY) => {
+        cursorContext.setTransform(1, 0, 0, 1, 0, 0);
+        cursorContext.clearRect(0, 0, cursorCanvas.width, cursorCanvas.height);
+
+        if (clientX < 0 || clientY < 0) {
+          return;
+        }
+
+        if (activeTool === "pen") {
+          cursorContext.fillStyle = palette[activeColorIndex];
+          cursorContext.beginPath();
+          cursorContext.arc(
+            clientX * deviceScale,
+            clientY * deviceScale,
+            5 * deviceScale,
+            0,
+            Math.PI * 2,
+          );
+          cursorContext.fill();
+          return;
+        }
+
+        if (activeTool === "eraser") {
+          const radius = Math.max(
+            8,
+            (eraserWidths[activeWidthIndex] * viewState.scale) / 2,
+          );
+          cursorContext.strokeStyle = "rgba(80,80,80,.7)";
+          cursorContext.lineWidth = 1.5 * deviceScale;
+          cursorContext.setLineDash([4 * deviceScale, 3 * deviceScale]);
+          cursorContext.beginPath();
+          cursorContext.arc(
+            clientX * deviceScale,
+            clientY * deviceScale,
+            radius * deviceScale,
+            0,
+            Math.PI * 2,
+          );
+          cursorContext.stroke();
+        }
+      };
+
+      const setCanvasCursor = (tool) => {
+        liveCanvas.style.cursor = tool === "text" ? "text" : "none";
+      };
+
+      const simplifyPoints = (points, tolerance) => {
+        if (points.length <= 2) {
+          return points;
+        }
+
+        const firstPoint = points[0];
+        const lastPoint = points[points.length - 1];
+        const dx = lastPoint.x - firstPoint.x;
+        const dy = lastPoint.y - firstPoint.y;
+        const segmentLengthSquared = dx * dx + dy * dy;
+
+        let maxDistance = 0;
+        let splitIndex = 0;
+
+        for (let index = 1; index < points.length - 1; index++) {
+          const point = points[index];
+          const distance =
+            segmentLengthSquared === 0
+              ? Math.hypot(point.x - firstPoint.x, point.y - firstPoint.y)
+              : Math.abs(
+                  dy * point.x -
+                    dx * point.y +
+                    lastPoint.x * firstPoint.y -
+                    lastPoint.y * firstPoint.x,
+                ) / Math.sqrt(segmentLengthSquared);
+
+          if (distance > maxDistance) {
+            maxDistance = distance;
+            splitIndex = index;
+          }
+        }
+
+        if (maxDistance <= tolerance) {
+          return [firstPoint, lastPoint];
+        }
+
+        return [
+          ...simplifyPoints(points.slice(0, splitIndex + 1), tolerance).slice(
+            0,
+            -1,
+          ),
+          ...simplifyPoints(points.slice(splitIndex), tolerance),
+        ];
+      };
+
+      const pushHistorySnapshot = () => {
+        historySnapshots = historySnapshots.slice(0, historyIndex + 1);
+        historySnapshots.push(JSON.parse(JSON.stringify(strokes)));
+        historyIndex += 1;
+        syncUndoRedoState();
+      };
+
+      const syncUndoRedoState = () => {
+        undoButton.disabled = historyIndex === 0;
+        redoButton.disabled = historyIndex === historySnapshots.length - 1;
+      };
+
+      const clearLiveCanvas = () => {
+        liveContext.setTransform(1, 0, 0, 1, 0, 0);
+        liveContext.clearRect(0, 0, liveCanvas.width, liveCanvas.height);
+      };
+
+      const detectCircle = (points) => {
+        const pointCount = points.length;
+        if (pointCount < 12) {
+          return null;
+        }
+
+        let centerX = 0;
+        let centerY = 0;
+        for (const point of points) {
+          centerX += point.x;
+          centerY += point.y;
+        }
+
+        centerX /= pointCount;
+        centerY /= pointCount;
+
+        const radii = new Array(pointCount);
+        let radiusSum = 0;
+        let pathLength = 0;
+
+        for (let index = 0; index < pointCount; index++) {
+          const point = points[index];
+          radii[index] = Math.hypot(point.x - centerX, point.y - centerY);
+          radiusSum += radii[index];
+
+          if (index > 0) {
+            const previousPoint = points[index - 1];
+            pathLength += Math.hypot(
+              point.x - previousPoint.x,
+              point.y - previousPoint.y,
+            );
+          }
+        }
+
+        const averageRadius = radiusSum / pointCount;
+        if (averageRadius < 10) {
+          return null;
+        }
+
+        let varianceSum = 0;
+        for (const radius of radii) {
+          varianceSum += (radius - averageRadius) ** 2;
+        }
+
+        const relativeDeviation =
+          Math.sqrt(varianceSum / pointCount) / averageRadius;
+        const startPoint = points[0];
+        const endPoint = points[pointCount - 1];
+        const closureDistance = Math.hypot(
+          startPoint.x - endPoint.x,
+          startPoint.y - endPoint.y,
+        );
+
+        if (
+          relativeDeviation > 0.26 ||
+          pathLength < Math.PI * averageRadius * 1.5 ||
+          closureDistance > averageRadius * 0.55
+        ) {
+          return null;
+        }
+
+        return { cx: centerX, cy: centerY, r: averageRadius };
+      };
+
+      const animateCircleInsertion = (circleStroke, onComplete) => {
+        const animationStart = performance.now();
+
+        const drawFrame = (frameTime) => {
+          const progress = Math.min((frameTime - animationStart) / 340, 1);
+          const popScale =
+            progress < 0.65
+              ? (progress / 0.65) * 1.06
+              : 1.06 - ((progress - 0.65) / 0.35) * 0.06;
+
+          liveContext.setTransform(1, 0, 0, 1, 0, 0);
+          liveContext.clearRect(0, 0, liveCanvas.width, liveCanvas.height);
+
+          liveContext.save();
+          applyViewTransform(liveContext);
+          liveContext.translate(circleStroke.cx, circleStroke.cy);
+          liveContext.scale(0.82 + 0.18 * popScale, 0.82 + 0.18 * popScale);
+          liveContext.translate(-circleStroke.cx, -circleStroke.cy);
+          liveContext.globalAlpha = Math.min(progress * 4, 1);
+          liveContext.strokeStyle = circleStroke.color;
+          liveContext.lineWidth = circleStroke.w;
+          liveContext.lineCap = "round";
+          liveContext.beginPath();
+          liveContext.arc(
+            circleStroke.cx,
+            circleStroke.cy,
+            circleStroke.r,
+            0,
+            Math.PI * 2,
+          );
+          liveContext.stroke();
+          liveContext.restore();
+
+          if (progress < 1) {
+            requestAnimationFrame(drawFrame);
+            return;
+          }
+
+          onComplete();
+        };
+
+        requestAnimationFrame(drawFrame);
+      };
+
+      const finalizeStroke = () => {
+        if (!activeStrokePoints.length) {
+          return;
+        }
+
+        const isEraser = activeTool === "eraser";
+        const width = isEraser
+          ? eraserWidths[activeWidthIndex]
+          : strokeWidths[activeWidthIndex];
+
+        if (!isEraser) {
+          const circle = detectCircle(activeStrokePoints);
+          if (circle) {
+            activeStrokePoints = [];
+            clearLiveCanvas();
+
+            const circleStroke = {
+              type: "circle",
+              cx: circle.cx,
+              cy: circle.cy,
+              r: circle.r,
+              color: palette[activeColorIndex],
+              w: width,
+            };
+
+            animateCircleInsertion(circleStroke, () => {
+              strokes = [...strokes, circleStroke];
+              pushHistorySnapshot();
+              drawStroke(baseContext, circleStroke);
+              clearLiveCanvas();
+            });
+            return;
+          }
+        }
+
+        const rawStroke = {
+          type: isEraser ? "eraser" : "pen",
+          color: palette[activeColorIndex],
+          w: width,
+          pts: activeStrokePoints,
+        };
+
+        const finalizedStroke =
+          rawStroke.type === "text" ||
+          !rawStroke.pts ||
+          rawStroke.pts.length <= 2
+            ? rawStroke
+            : {
+                ...rawStroke,
+                pts: simplifyPoints(
+                  rawStroke.pts,
+                  rawStroke.type === "eraser"
+                    ? 10
+                    : (simplifyThresholds[strokeWidths.indexOf(rawStroke.w)] ??
+                        2),
+                ),
+              };
+
+        strokes = [...strokes, finalizedStroke];
+        pushHistorySnapshot();
+
+        if (!isEraser) {
+          drawStroke(baseContext, finalizedStroke);
+          clearLiveCanvas();
+        }
+
+        activeStrokePoints = [];
+      };
+
+      const cancelStroke = () => {
+        activeStrokePoints = [];
+        clearLiveCanvas();
+
+        if (activeTool === "eraser") {
+          scheduleBaseRedraw();
+        }
+      };
+
+      const getPinchSnapshot = () => {
+        const pointerIterator = activePointers.values();
+        const firstPointer = pointerIterator.next().value;
+        const secondPointer = pointerIterator.next().value;
+
+        if (!secondPointer) {
+          return null;
+        }
+
+        return {
+          mid: {
+            x: (firstPointer.x + secondPointer.x) / 2,
+            y: (firstPointer.y + secondPointer.y) / 2,
+          },
+          dist: Math.hypot(
+            secondPointer.x - firstPointer.x,
+            secondPointer.y - firstPointer.y,
+          ),
+        };
+      };
+
+      const beginStroke = (clientX, clientY) => {
+        isDrawing = true;
+
+        const worldPoint = clientToWorld(clientX, clientY);
+        activeStrokePoints = [worldPoint];
+
+        const isEraser = activeTool === "eraser";
+        const width = isEraser
+          ? eraserWidths[activeWidthIndex]
+          : strokeWidths[activeWidthIndex];
+        const targetContext = isEraser ? baseContext : liveContext;
+
+        applyViewTransform(targetContext);
+        targetContext.fillStyle = isEraser ? "#fff" : palette[activeColorIndex];
+        targetContext.beginPath();
+        targetContext.arc(
+          worldPoint.x,
+          worldPoint.y,
+          width / 2,
+          0,
+          Math.PI * 2,
+        );
+        targetContext.fill();
+      };
+
+      const beginTextEntry = (clientX, clientY) => {
+        const worldPoint = clientToWorld(clientX, clientY);
+        const fontSize = textSizes[activeWidthIndex];
+        const scaledFontSize = fontSize * viewState.scale;
+
+        textInput.style.cssText = [
+          "display:block",
+          `left:${clientX}px`,
+          `top:${clientY - scaledFontSize * 0.82}px`,
+          `font-size:${scaledFontSize}px`,
+          `color:${palette[activeColorIndex]}`,
+          "height:auto",
+          `min-height:${scaledFontSize * 1.35}px`,
+        ].join(";");
+
+        textInput.value = "";
+        textInput.dataset.wx = worldPoint.x;
+        textInput.dataset.wy = worldPoint.y;
+        textInput.dataset.fs = fontSize;
+        textInput.dataset.ci = activeColorIndex;
+        textInput.focus();
+      };
+
+      const drawStrokeSegment = (context, points, color, width) => {
+        if (points.length < 2) {
+          return;
+        }
+
+        context.strokeStyle = color;
+        context.fillStyle = color;
+        context.lineWidth = width;
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        context.beginPath();
+
+        if (points.length === 2) {
+          context.moveTo(points[0].x, points[0].y);
+          context.lineTo(points[1].x, points[1].y);
+          context.stroke();
+          return;
+        }
+
+        const controlPointIndex = points.length - 2;
+        const previousPoint =
+          points[controlPointIndex - 1] ?? points[controlPointIndex];
+        const currentPoint = points[controlPointIndex];
+        const nextPoint = points[controlPointIndex + 1];
+
+        context.moveTo(
+          (previousPoint.x + currentPoint.x) / 2,
+          (previousPoint.y + currentPoint.y) / 2,
+        );
+        context.quadraticCurveTo(
+          currentPoint.x,
+          currentPoint.y,
+          (currentPoint.x + nextPoint.x) / 2,
+          (currentPoint.y + nextPoint.y) / 2,
+        );
+        context.stroke();
+      };
+
+      const updateStroke = (clientX, clientY) => {
+        if (!isDrawing) {
+          return;
+        }
+
+        const worldPoint = clientToWorld(clientX, clientY);
+        const lastPoint = activeStrokePoints[activeStrokePoints.length - 1];
+        const dx = (worldPoint.x - lastPoint.x) * viewState.scale;
+        const dy = (worldPoint.y - lastPoint.y) * viewState.scale;
+
+        if (dx * dx + dy * dy < 4) {
+          return;
+        }
+
+        activeStrokePoints.push(worldPoint);
+
+        const isEraser = activeTool === "eraser";
+        drawStrokeSegment(
+          isEraser ? baseContext : liveContext,
+          activeStrokePoints,
+          isEraser ? "#fff" : palette[activeColorIndex],
+          isEraser
+            ? eraserWidths[activeWidthIndex]
+            : strokeWidths[activeWidthIndex],
+        );
+      };
+
+      const commitTextInput = () => {
+        if (isCommittingText || textInput.style.display === "none") {
+          return;
+        }
+
+        isCommittingText = true;
+        textInput.style.display = "none";
+
+        const value = textInput.value.trim();
+        if (value) {
+          const textStroke = {
+            type: "text",
+            text: value,
+            color: palette[Number(textInput.dataset.ci)],
+            x: Number(textInput.dataset.wx),
+            y: Number(textInput.dataset.wy),
+            fs: Number(textInput.dataset.fs),
+          };
+
+          strokes = [...strokes, textStroke];
+          pushHistorySnapshot();
+          drawStroke(baseContext, textStroke);
+        }
+
+        isCommittingText = false;
+      };
+
+      const encodeUnsignedVarint = (bytes, value) => {
+        let remaining = value >>> 0;
+        do {
+          const chunk = remaining & 127;
+          remaining >>>= 7;
+          bytes.push(remaining ? chunk | 128 : chunk);
+        } while (remaining);
+      };
+
+      const encodeSignedVarint = (bytes, value) => {
+        encodeUnsignedVarint(
+          bytes,
+          value >= 0 ? value * 2 : (-value - 1) * 2 + 1,
+        );
+      };
+
+      const readUnsignedVarint = (bytes, cursor) => {
+        let value = 0;
+        let shift = 0;
+
+        while (true) {
+          const chunk = bytes[cursor.i++];
+          value |= (chunk & 127) << shift;
+          shift += 7;
+
+          if ((chunk & 128) === 0) {
+            break;
+          }
+        }
+
+        return value >>> 0;
+      };
+
+      const readSignedVarint = (bytes, cursor) => {
+        const value = readUnsignedVarint(bytes, cursor);
+        return value & 1 ? -((value + 1) >> 1) : value >> 1;
+      };
+
+      const buildBinaryPayload = (strokeList, viewportSnapshot) => {
+        const bytes = [];
+
+        if (viewportSnapshot) {
+          const encodedScale =
+            Math.round(viewportSnapshot.scale * 1000) & 65535;
+          bytes.push(encodedScale & 255, encodedScale >> 8);
+          encodeSignedVarint(bytes, Math.round(viewportSnapshot.cx));
+          encodeSignedVarint(bytes, Math.round(viewportSnapshot.cy));
+        }
+
+        bytes.push(strokeList.length & 255, strokeList.length >> 8);
+
+        for (const stroke of strokeList) {
+          const typeCode =
+            stroke.type === "eraser"
+              ? 1
+              : stroke.type === "text"
+                ? 2
+                : stroke.type === "circle"
+                  ? 3
+                  : 0;
+          const colorCode = Math.max(0, palette.indexOf(stroke.color));
+          const widthCode =
+            stroke.type === "text"
+              ? Math.max(0, textSizes.indexOf(stroke.fs))
+              : stroke.type === "eraser"
+                ? Math.max(0, eraserWidths.indexOf(stroke.w))
+                : Math.max(0, strokeWidths.indexOf(stroke.w));
+
+          bytes.push((typeCode << 6) | (colorCode << 3) | (widthCode & 3));
+
+          if (stroke.type === "circle") {
+            encodeSignedVarint(bytes, Math.round(stroke.cx));
+            encodeSignedVarint(bytes, Math.round(stroke.cy));
+            encodeUnsignedVarint(bytes, Math.max(0, Math.round(stroke.r)));
+            continue;
+          }
+
+          if (stroke.type === "text") {
+            const encodedX = Math.max(
+              0,
+              Math.min(65535, Math.round(stroke.x) + 32768),
+            );
+            const encodedY = Math.max(
+              0,
+              Math.min(65535, Math.round(stroke.y) + 32768),
+            );
+            bytes.push(
+              encodedX & 255,
+              encodedX >> 8,
+              encodedY & 255,
+              encodedY >> 8,
+            );
+
+            const encodedText = new TextEncoder().encode(
+              (stroke.text || "").slice(0, 500),
+            );
+            encodeUnsignedVarint(bytes, encodedText.length);
+            for (const byte of encodedText) {
+              bytes.push(byte);
+            }
+            continue;
+          }
+
+          const points = stroke.pts || [];
+          bytes.push(points.length & 255, points.length >> 8);
+          if (!points.length) {
+            continue;
+          }
+
+          const firstPointX = Math.max(
+            0,
+            Math.min(65535, Math.round(points[0].x) + 32768),
+          );
+          const firstPointY = Math.max(
+            0,
+            Math.min(65535, Math.round(points[0].y) + 32768),
+          );
+          bytes.push(
+            firstPointX & 255,
+            firstPointX >> 8,
+            firstPointY & 255,
+            firstPointY >> 8,
+          );
+
+          let previousX = Math.round(points[0].x);
+          let previousY = Math.round(points[0].y);
+
+          for (let index = 1; index < points.length; index++) {
+            const pointX = Math.round(points[index].x);
+            const pointY = Math.round(points[index].y);
+            encodeSignedVarint(bytes, pointX - previousX);
+            encodeSignedVarint(bytes, pointY - previousY);
+            previousX = pointX;
+            previousY = pointY;
+          }
+        }
+
+        return new Uint8Array(bytes);
+      };
+
+      const maybeCompress = async (bytes) => {
+        if (!("CompressionStream" in window)) {
+          return { bytes, compressed: false };
+        }
+
+        try {
+          const stream = new CompressionStream("deflate-raw");
+          const writer = stream.writable.getWriter();
+          writer.write(bytes);
+          writer.close();
+
+          const compressedBytes = new Uint8Array(
+            await new Response(stream.readable).arrayBuffer(),
+          );
+          return compressedBytes.length < bytes.length
+            ? { bytes: compressedBytes, compressed: true }
+            : { bytes, compressed: false };
+        } catch {
+          return { bytes, compressed: false };
+        }
+      };
+
+      const bytesToBase64Url = (bytes) => {
+        let binary = "";
+        for (let index = 0; index < bytes.length; index++) {
+          binary += String.fromCharCode(bytes[index]);
+        }
+
+        return btoa(binary)
+          .replace(/\+/g, "-")
+          .replace(/\//g, "_")
+          .replace(/=/g, "");
+      };
+
+      const base64UrlToBytes = (encoded) => {
+        const binary = atob(encoded.replace(/-/g, "+").replace(/_/g, "/"));
+        const bytes = new Uint8Array(binary.length);
+
+        for (let index = 0; index < binary.length; index++) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+
+        return bytes;
+      };
+
+      const encodeScene = async (strokeList) => {
+        const viewportWidth = innerWidth;
+        const viewportHeight = innerHeight;
+
+        const payload = buildBinaryPayload(strokeList, {
+          scale: viewState.scale,
+          cx: Math.round((-viewState.x + viewportWidth / 2) / viewState.scale),
+          cy: Math.round((-viewState.y + viewportHeight / 2) / viewState.scale),
+        });
+
+        const { bytes, compressed } = await maybeCompress(payload);
+        const packet = new Uint8Array(2 + bytes.length);
+        packet[0] = 171;
+        packet[1] = compressed ? 5 : 4;
+        packet.set(bytes, 2);
+
+        return bytesToBase64Url(packet);
+      };
+
+      const maybeDecompress = async (bytes) => {
+        if (!("DecompressionStream" in window)) {
+          return bytes;
+        }
+
+        try {
+          const stream = new DecompressionStream("deflate-raw");
+          const writer = stream.writable.getWriter();
+          writer.write(bytes);
+          writer.close();
+          return new Uint8Array(
+            await new Response(stream.readable).arrayBuffer(),
+          );
+        } catch {
+          return bytes;
+        }
+      };
+
+      const decodeBinaryPayload = (bytes, hasViewportSnapshot) => {
+        const cursor = { i: 0 };
+        let viewport = null;
+
+        if (hasViewportSnapshot) {
+          const encodedScale = bytes[cursor.i] | (bytes[cursor.i + 1] << 8);
+          cursor.i += 2;
+          viewport = {
+            scale: encodedScale / 1000,
+            cx: readSignedVarint(bytes, cursor),
+            cy: readSignedVarint(bytes, cursor),
+          };
+        }
+
+        const strokeCount = bytes[cursor.i] | (bytes[cursor.i + 1] << 8);
+        cursor.i += 2;
+
+        const decodedStrokes = [];
+
+        for (let strokeIndex = 0; strokeIndex < strokeCount; strokeIndex++) {
+          const header = bytes[cursor.i++];
+          const typeCode = (header >> 6) & 3;
+          const colorCode = (header >> 3) & 7;
+          const widthCode = header & 3;
+          const color = palette[Math.min(colorCode, 5)];
+          const type =
+            typeCode === 1
+              ? "eraser"
+              : typeCode === 2
+                ? "text"
+                : typeCode === 3
+                  ? "circle"
+                  : "pen";
+
+          if (type === "circle") {
+            decodedStrokes.push({
+              type: "circle",
+              cx: readSignedVarint(bytes, cursor),
+              cy: readSignedVarint(bytes, cursor),
+              r: readUnsignedVarint(bytes, cursor),
+              color,
+              w: strokeWidths[widthCode] || strokeWidths[0],
+            });
+            continue;
+          }
+
+          if (type === "text") {
+            const x = (bytes[cursor.i] | (bytes[cursor.i + 1] << 8)) - 32768;
+            cursor.i += 2;
+            const y = (bytes[cursor.i] | (bytes[cursor.i + 1] << 8)) - 32768;
+            cursor.i += 2;
+            const textLength = readUnsignedVarint(bytes, cursor);
+            const text = new TextDecoder().decode(
+              bytes.slice(cursor.i, cursor.i + textLength),
+            );
+            cursor.i += textLength;
+
+            decodedStrokes.push({
+              type: "text",
+              text,
+              color,
+              x,
+              y,
+              fs: textSizes[widthCode] || textSizes[0],
+            });
+            continue;
+          }
+
+          const pointCount = bytes[cursor.i] | (bytes[cursor.i + 1] << 8);
+          cursor.i += 2;
+
+          const points = [];
+          if (pointCount > 0) {
+            let currentX =
+              (bytes[cursor.i] | (bytes[cursor.i + 1] << 8)) - 32768;
+            cursor.i += 2;
+            let currentY =
+              (bytes[cursor.i] | (bytes[cursor.i + 1] << 8)) - 32768;
+            cursor.i += 2;
+            points.push({ x: currentX, y: currentY });
+
+            for (let pointIndex = 1; pointIndex < pointCount; pointIndex++) {
+              currentX += readSignedVarint(bytes, cursor);
+              currentY += readSignedVarint(bytes, cursor);
+              points.push({ x: currentX, y: currentY });
+            }
+          }
+
+          decodedStrokes.push({
+            type,
+            color,
+            w:
+              type === "eraser"
+                ? eraserWidths[widthCode] || eraserWidths[0]
+                : strokeWidths[widthCode] || strokeWidths[0],
+            pts: points,
+          });
+        }
+
+        return { strokes: decodedStrokes, vp: viewport };
+      };
+
+      const decodeLegacyHash = (encoded) => {
+        if (typeof LZString === "undefined") {
+          return null;
+        }
+
+        const json = LZString.decompressFromEncodedURIComponent(encoded);
+        if (!json) {
+          return null;
+        }
+
+        const legacyColorMap = {
+          "var(--c0)": "#363028",
+          "var(--c1)": "#C9A89A",
+          "var(--c2)": "#8FA89A",
+          "var(--c3)": "#8A9BAE",
+          "var(--c4)": "#C4B49A",
+          "var(--c5)": "#A898AE",
+        };
+
+        return {
+          strokes: JSON.parse(json).map((stroke) => ({
+            ...stroke,
+            color: legacyColorMap[stroke.color] || stroke.color || palette[0],
+          })),
+          vp: null,
+        };
+      };
+
+      const decodeScene = async (encoded) => {
+        try {
+          const packet = base64UrlToBytes(encoded);
+
+          if (packet[0] === 171) {
+            const version = packet[1];
+            const hasViewportSnapshot = version === 4 || version === 5;
+            let payload = packet.slice(2);
+
+            if (version === 3 || version === 5) {
+              payload = await maybeDecompress(payload);
+            }
+
+            return decodeBinaryPayload(payload, hasViewportSnapshot);
+          }
+        } catch {}
+
+        try {
+          return decodeLegacyHash(encoded);
+        } catch {}
+
+        return null;
+      };
+
+      const showToast = (message) => {
+        toast.textContent = message;
+        toast.classList.add("show");
+        clearTimeout(toastTimerId);
+        toastTimerId = setTimeout(() => toast.classList.remove("show"), 3000);
+      };
+
+      const resetView = () => {
+        viewState.x = 0;
+        viewState.y = 0;
+        viewState.scale = 1;
+        updateZoomHud();
+        scheduleBaseRedraw();
+        drawCursorOverlay(hoverClientX, hoverClientY);
+      };
+
+      const fitSceneIntoViewport = () => {
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+
+        for (const stroke of strokes) {
+          if (stroke.type === "text") {
+            minX = Math.min(minX, stroke.x);
+            minY = Math.min(minY, stroke.y - stroke.fs);
+            maxX = Math.max(maxX, stroke.x + 200);
+            maxY = Math.max(maxY, stroke.y + 20);
+            continue;
+          }
+
+          if (stroke.type === "circle") {
+            minX = Math.min(minX, stroke.cx - stroke.r);
+            minY = Math.min(minY, stroke.cy - stroke.r);
+            maxX = Math.max(maxX, stroke.cx + stroke.r);
+            maxY = Math.max(maxY, stroke.cy + stroke.r);
+            continue;
+          }
+
+          if (!stroke.pts?.length) {
+            continue;
+          }
+
+          for (const point of stroke.pts) {
+            minX = Math.min(minX, point.x);
+            minY = Math.min(minY, point.y);
+            maxX = Math.max(maxX, point.x);
+            maxY = Math.max(maxY, point.y);
+          }
+        }
+
+        if (minX === Infinity) {
+          return;
+        }
+
+        const viewportWidth = innerWidth;
+        const viewportHeight = innerHeight;
+        const padding = 80;
+        const paddedWidth = maxX - minX + 160;
+        const paddedHeight = maxY - minY + 160;
+
+        viewState.scale = Math.min(
+          viewportWidth / paddedWidth,
+          viewportHeight / paddedHeight,
+          1,
+        );
+        viewState.x =
+          (viewportWidth - paddedWidth * viewState.scale) / 2 -
+          minX * viewState.scale +
+          padding * viewState.scale;
+        viewState.y =
+          (viewportHeight - paddedHeight * viewState.scale) / 2 -
+          minY * viewState.scale +
+          padding * viewState.scale;
+        updateZoomHud();
+        scheduleBaseRedraw();
+      };
+
+      liveCanvas.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        liveCanvas.setPointerCapture(event.pointerId);
+        activePointers.set(event.pointerId, {
+          x: event.clientX,
+          y: event.clientY,
+        });
+
+        const isMouse = event.pointerType === "mouse";
+
+        if (isMouse && event.button === 1) {
+          if (isDrawing) {
+            cancelStroke();
+            drawingPointerId = -1;
+          }
+
+          isMiddleMousePanning = true;
+          panStartPointer = { x: event.clientX, y: event.clientY };
+          panStartView = { ...viewState };
+          liveCanvas.style.cursor = "grabbing";
+          return;
+        }
+
+        if (isSpacePanning && isMouse && event.button === 0) {
+          if (isDrawing) {
+            cancelStroke();
+            drawingPointerId = -1;
+          }
+
+          isDraggingCanvas = true;
+          panStartPointer = { x: event.clientX, y: event.clientY };
+          panStartView = { ...viewState };
+          liveCanvas.style.cursor = "grabbing";
+          return;
+        }
+
+        if (activePointers.size >= 2) {
+          if (isDrawing) {
+            cancelStroke();
+            drawingPointerId = -1;
+          }
+
+          pinchGesture = getPinchSnapshot();
+          return;
+        }
+
+        if (pinchGesture || (isMouse && event.button !== 0)) {
+          return;
+        }
+
+        if (activeTool !== "text") {
+          drawingPointerId = event.pointerId;
+          beginStroke(event.clientX, event.clientY);
+          return;
+        }
+
+        beginTextEntry(event.clientX, event.clientY);
+      });
+
+      liveCanvas.addEventListener("pointermove", (event) => {
+        event.preventDefault();
+
+        if (event.pointerType !== "touch") {
+          hoverClientX = event.clientX;
+          hoverClientY = event.clientY;
+          drawCursorOverlay(hoverClientX, hoverClientY);
+        }
+
+        if (!activePointers.has(event.pointerId)) {
+          return;
+        }
+
+        activePointers.set(event.pointerId, {
+          x: event.clientX,
+          y: event.clientY,
+        });
+
+        if (isDraggingCanvas || isMiddleMousePanning) {
+          viewState.x = panStartView.x + (event.clientX - panStartPointer.x);
+          viewState.y = panStartView.y + (event.clientY - panStartPointer.y);
+          scheduleBaseRedraw();
+          return;
+        }
+
+        if (pinchGesture && activePointers.size >= 2) {
+          const currentPinch = getPinchSnapshot();
+          if (!currentPinch) {
+            return;
+          }
+
+          const nextScale = Math.max(
+            0.05,
+            Math.min(
+              20,
+              viewState.scale * (currentPinch.dist / pinchGesture.dist),
+            ),
+          );
+          const scaleRatio = nextScale / viewState.scale;
+
+          viewState.x =
+            pinchGesture.mid.x -
+            (pinchGesture.mid.x - viewState.x) * scaleRatio +
+            (currentPinch.mid.x - pinchGesture.mid.x);
+          viewState.y =
+            pinchGesture.mid.y -
+            (pinchGesture.mid.y - viewState.y) * scaleRatio +
+            (currentPinch.mid.y - pinchGesture.mid.y);
+          viewState.scale = nextScale;
+          pinchGesture = currentPinch;
+
+          updateZoomHud();
+          scheduleBaseRedraw();
+
+          if (activeTool === "eraser") {
+            drawCursorOverlay(hoverClientX, hoverClientY);
+          }
+          return;
+        }
+
+        if (isDrawing && event.pointerId === drawingPointerId) {
+          updateStroke(event.clientX, event.clientY);
+        }
+      });
+
+      liveCanvas.addEventListener("pointerup", (event) => {
+        event.preventDefault();
+        activePointers.delete(event.pointerId);
+
+        if (!isDraggingCanvas && !isMiddleMousePanning) {
+          if (event.pointerId === drawingPointerId) {
+            drawingPointerId = -1;
+            if (isDrawing) {
+              isDrawing = false;
+              finalizeStroke();
+            }
+            return;
+          }
+
+          if (activePointers.size < 2) {
+            pinchGesture = null;
+          }
+          return;
+        }
+
+        if (!event.buttons || event.button === 1) {
+          isDraggingCanvas = false;
+          isMiddleMousePanning = false;
+          liveCanvas.style.cursor = activeTool === "text" ? "text" : "none";
+          if (isSpacePanning) {
+            liveCanvas.style.cursor = "grab";
+          }
+        }
+      });
+
+      liveCanvas.addEventListener("pointercancel", (event) => {
+        event.preventDefault();
+        activePointers.delete(event.pointerId);
+
+        if (event.pointerId === drawingPointerId) {
+          cancelStroke();
+          drawingPointerId = -1;
+        }
+
+        if (activePointers.size < 2) {
+          pinchGesture = null;
+        }
+
+        isDraggingCanvas = false;
+        isMiddleMousePanning = false;
+        liveCanvas.style.cursor = activeTool === "text" ? "text" : "none";
+      });
+
+      liveCanvas.addEventListener("pointerleave", (event) => {
+        if (!activePointers.has(event.pointerId)) {
+          hoverClientX = -999;
+          hoverClientY = -999;
+          drawCursorOverlay(-1, -1);
+        }
+      });
+
+      liveCanvas.addEventListener(
+        "wheel",
+        (event) => {
+          event.preventDefault();
+
+          if (isDrawing) {
+            return;
+          }
+
+          if (event.ctrlKey || event.metaKey) {
+            zoomAroundPoint(
+              Math.pow(0.998, event.deltaY),
+              event.clientX,
+              event.clientY,
+            );
+          } else {
+            viewState.x -= event.deltaX * 1.2;
+            viewState.y -= event.deltaY * 1.2;
+            updateZoomHud();
+          }
+
+          scheduleBaseRedraw();
+
+          if (activeTool === "eraser" && hoverClientX > 0) {
+            drawCursorOverlay(hoverClientX, hoverClientY);
+          }
+        },
+        { passive: false },
+      );
+
+      document.addEventListener("keydown", (event) => {
+        if (textInput.style.display === "block") {
+          return;
+        }
+
+        if (
+          event.code === "Space" &&
+          !isSpacePanning &&
+          !isDrawing &&
+          !event.repeat
+        ) {
+          isSpacePanning = true;
+          event.preventDefault();
+          liveCanvas.style.cursor = "grab";
+        }
+
+        const hasCommandModifier = event.ctrlKey || event.metaKey;
+
+        if (hasCommandModifier && event.key === "z") {
+          event.preventDefault();
+          undoButton.click();
+        }
+
+        if (
+          hasCommandModifier &&
+          (event.key === "y" || (event.shiftKey && event.key === "Z"))
+        ) {
+          event.preventDefault();
+          redoButton.click();
+        }
+
+        if (hasCommandModifier || event.shiftKey) {
+          return;
+        }
+
+        if (event.key === "p") {
+          getElement("btn-pen").click();
+        }
+        if (event.key === "t") {
+          getElement("btn-text").click();
+        }
+        if (event.key === "e") {
+          getElement("btn-eraser").click();
+        }
+        if (event.key === "0") {
+          resetView();
+        }
+      });
+
+      document.addEventListener("keyup", (event) => {
+        if (event.code === "Space") {
+          isSpacePanning = false;
+          isDraggingCanvas = false;
+          liveCanvas.style.cursor = activeTool === "text" ? "text" : "none";
+        }
+      });
+
+      textInput.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          textInput.style.display = "none";
+          return;
+        }
+
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          commitTextInput();
+          return;
+        }
+
+        setTimeout(() => {
+          textInput.style.height = "auto";
+          textInput.style.height = textInput.scrollHeight + "px";
+        }, 0);
+      });
+
+      textInput.addEventListener("blur", () => {
+        if (!isCommittingText) {
+          commitTextInput();
+        }
+      });
+
+      undoButton.addEventListener("click", () => {
+        if (historyIndex === 0) {
+          return;
+        }
+
+        historyIndex -= 1;
+        strokes = JSON.parse(JSON.stringify(historySnapshots[historyIndex]));
+        redrawBaseCanvas();
+        syncUndoRedoState();
+      });
+
+      redoButton.addEventListener("click", () => {
+        if (historyIndex >= historySnapshots.length - 1) {
+          return;
+        }
+
+        historyIndex += 1;
+        strokes = JSON.parse(JSON.stringify(historySnapshots[historyIndex]));
+        redrawBaseCanvas();
+        syncUndoRedoState();
+      });
+
+      const toolButtons = ["pen", "text", "eraser"].map((toolName) =>
+        getElement(`btn-${toolName}`),
+      );
+      toolButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+          toolButtons.forEach((toolButton) =>
+            toolButton.classList.remove("on"),
+          );
+          button.classList.add("on");
+
+          activeTool = button.id.slice(4);
+
+          if (textInput.style.display === "block") {
+            commitTextInput();
+          }
+
+          setCanvasCursor(activeTool);
+          drawCursorOverlay(hoverClientX, hoverClientY);
+        });
+      });
+
+      const colorButtons = document.querySelectorAll(".cb");
+      colorButtons.forEach((button, colorIndex) => {
+        button.addEventListener("click", () => {
+          colorButtons.forEach((colorButton) =>
+            colorButton.classList.remove("on"),
+          );
+          button.classList.add("on");
+          activeColorIndex = colorIndex;
+
+          if (textInput.style.display === "block") {
+            textInput.style.color = palette[colorIndex];
+          }
+
+          drawCursorOverlay(hoverClientX, hoverClientY);
+        });
+      });
+
+      const widthButtons = document.querySelectorAll(".wb");
+      widthButtons.forEach((button, widthIndex) => {
+        button.addEventListener("click", () => {
+          widthButtons.forEach((widthButton) =>
+            widthButton.classList.remove("on"),
+          );
+          button.classList.add("on");
+          activeWidthIndex = widthIndex;
+          drawCursorOverlay(hoverClientX, hoverClientY);
+        });
+      });
+
+      zoomHud.addEventListener("click", () => {
+        resetView();
+      });
+
+      getElement("btn-save").addEventListener("click", async () => {
+        const saveButton = getElement("btn-save");
+        saveButton.disabled = true;
+        saveButton.style.opacity = ".25";
+
+        try {
+          const encodedScene = await encodeScene(strokes);
+          const shareUrl =
+            location.origin + location.pathname + "#" + encodedScene;
+
+          history.replaceState(null, "", "#" + encodedScene);
+          await navigator.clipboard.writeText(shareUrl).catch(() => {});
+
+          showToast(
+            `Link copied · ${((encodedScene.length * 0.75) / 1024).toFixed(1)} KB`,
+          );
+        } catch {
+          showToast("Save failed");
+        } finally {
+          saveButton.disabled = false;
+          saveButton.style.opacity = "";
+        }
+      });
+
+      (async () => {
+        resizeCanvases();
+        redrawBaseCanvas();
+        syncUndoRedoState();
+        setCanvasCursor("pen");
+
+        const encodedScene = location.hash.slice(1);
+        if (!encodedScene) {
+          return;
+        }
+
+        try {
+          const decodedScene = await decodeScene(encodedScene);
+          if (!decodedScene?.strokes?.length) {
+            return;
+          }
+
+          strokes = decodedScene.strokes;
+          historySnapshots = [[], JSON.parse(JSON.stringify(strokes))];
+          historyIndex = 1;
+
+          if (decodedScene.vp) {
+            const viewportWidth = innerWidth;
+            const viewportHeight = innerHeight;
+
+            viewState.scale = decodedScene.vp.scale;
+            viewState.x =
+              viewportWidth / 2 - decodedScene.vp.cx * viewState.scale;
+            viewState.y =
+              viewportHeight / 2 - decodedScene.vp.cy * viewState.scale;
+            updateZoomHud();
+          } else {
+            fitSceneIntoViewport();
+          }
+
+          redrawBaseCanvas();
+          syncUndoRedoState();
+        } catch {}
+      })();
+    </script>
+    <style rel="stylesheet" crossorigin>
+      *,
+      *:before,
+      *:after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      :root {
+        --blue: #007aff;
+        --glass: rgba(255, 255, 255, 0.78);
+        --glass-border: rgba(0, 0, 0, 0.13);
+        --label: rgba(0, 0, 0, 0.84);
+        --secondary: rgba(0, 0, 0, 0.42);
+        --fill: rgba(120, 120, 128, 0.11);
+        --sep-c: rgba(60, 60, 67, 0.16);
+        --c0: #363028;
+        --c1: #c9a89a;
+        --c2: #8fa89a;
+        --c3: #8a9bae;
+        --c4: #c4b49a;
+        --c5: #a898ae;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #f2f2f7;
+        font-family:
+          -apple-system,
+          BlinkMacSystemFont,
+          SF Pro Text,
+          Helvetica Neue,
+          Arial,
+          sans-serif;
+        -webkit-font-smoothing: antialiased;
+        overscroll-behavior: none;
+      }
+
+      #base,
+      #live,
+      #cur {
+        position: fixed;
+        top: 0;
+        left: 0;
+        display: block;
+      }
+
+      #base {
+        background: #fff;
+      }
+
+      #live {
+        background: transparent;
+        z-index: 1;
+        cursor: none;
+      }
+
+      #cur {
+        background: transparent;
+        z-index: 2;
+        pointer-events: none;
+      }
+
+      #ti {
+        position: fixed;
+        z-index: 3;
+        display: none;
+        background: transparent;
+        border: none;
+        outline: none;
+        resize: none;
+        overflow: hidden;
+        font-family: Lora, Georgia, serif;
+        line-height: 1.35;
+        padding: 0;
+        min-width: 40px;
+        caret-color: currentColor;
+        touch-action: none;
+      }
+
+      #bar {
+        position: fixed;
+        bottom: calc(22px + env(safe-area-inset-bottom, 0px));
+        left: 50%;
+        transform: translate(-50%);
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        gap: 1px;
+        background: var(--glass);
+        -webkit-backdrop-filter: blur(24px) saturate(180%);
+        backdrop-filter: blur(24px) saturate(180%);
+        border: 0.5px solid var(--glass-border);
+        border-radius: 18px;
+        padding: 5px 8px;
+        box-shadow:
+          0 4px 28px #00000017,
+          0 1px 4px #0000000f,
+          inset 0 0.5px #ffffffe6;
+        animation: barIn 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+      }
+
+      @keyframes barIn {
+        0% {
+          opacity: 0;
+          transform: translate(-50%) translateY(18px);
+        }
+
+        to {
+          opacity: 1;
+          transform: translate(-50%) translateY(0);
+        }
+      }
+
+      .sep {
+        width: 0.5px;
+        height: 18px;
+        background: var(--sep-c);
+        margin: 0 5px;
+        flex-shrink: 0;
+      }
+
+      .tb {
+        width: 34px;
+        height: 34px;
+        border-radius: 10px;
+        border: none;
+        background: transparent;
+        color: var(--label);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition:
+          background 0.1s,
+          color 0.1s,
+          opacity 0.1s;
+        opacity: 0.46;
+        flex-shrink: 0;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      .tb svg {
+        pointer-events: none;
+      }
+
+      .tb:hover {
+        opacity: 0.72;
+        background: var(--fill);
+      }
+
+      .tb.on {
+        opacity: 1;
+        color: var(--blue);
+        background: #007aff17;
+      }
+
+      .tb:disabled {
+        opacity: 0.18;
+        cursor: default;
+        pointer-events: none;
+      }
+
+      .cb {
+        width: 19px;
+        height: 19px;
+        border-radius: 50%;
+        border: 1.5px solid transparent;
+        cursor: pointer;
+        flex-shrink: 0;
+        transition:
+          transform 0.15s,
+          box-shadow 0.15s;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      .cb:hover {
+        transform: scale(1.22);
+      }
+
+      .cb.on {
+        transform: scale(1.15);
+        box-shadow:
+          0 0 0 1.5px #fff,
+          0 0 0 3px #0000005c;
+      }
+
+      .wb {
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        border-radius: 8px;
+        opacity: 0.38;
+        flex-shrink: 0;
+        transition:
+          opacity 0.12s,
+          background 0.12s;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      .wb:hover,
+      .wb.on {
+        opacity: 1;
+      }
+
+      .wb.on {
+        background: #007aff17;
+      }
+
+      .dot {
+        background: var(--label);
+        border-radius: 50%;
+        display: block;
+        transition: background 0.12s;
+      }
+
+      .wb.on .dot {
+        background: var(--blue);
+      }
+
+      #zoom-hud {
+        position: fixed;
+        top: 14px;
+        right: 14px;
+        z-index: 10;
+        background: var(--glass);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        backdrop-filter: blur(20px) saturate(180%);
+        border: 0.5px solid var(--glass-border);
+        border-radius: 10px;
+        padding: 5px 10px;
+        font-size: 12px;
+        font-weight: 500;
+        letter-spacing: -0.01em;
+        color: var(--secondary);
+        cursor: pointer;
+        transition:
+          color 0.12s,
+          background 0.12s;
+        -webkit-tap-highlight-color: transparent;
+        box-shadow: 0 1px 8px #00000012;
+        animation: fadeIn 0.5s ease both;
+      }
+
+      #zoom-hud:hover {
+        color: var(--label);
+        background: #fffffff0;
+      }
+
+      @keyframes fadeIn {
+        0% {
+          opacity: 0;
+        }
+
+        to {
+          opacity: 1;
+        }
+      }
+
+      #toast {
+        position: fixed;
+        top: 14px;
+        left: 50%;
+        transform: translate(-50%) translateY(-10px);
+        z-index: 20;
+        background: #000000c2;
+        -webkit-backdrop-filter: blur(20px);
+        backdrop-filter: blur(20px);
+        color: #fff;
+        padding: 8px 16px;
+        border-radius: 20px;
+        font-size: 13px;
+        font-weight: 500;
+        opacity: 0;
+        transition:
+          opacity 0.22s,
+          transform 0.22s;
+        pointer-events: none;
+        white-space: nowrap;
+      }
+
+      #toast.show {
+        opacity: 1;
+        transform: translate(-50%) translateY(0);
+      }
+
+      @media (max-width: 600px) {
+        #bar {
+          padding: 4px 6px;
+          gap: 0;
+        }
+
+        .tb {
+          width: 30px;
+          height: 30px;
+          border-radius: 8px;
+        }
+
+        .cb {
+          width: 17px;
+          height: 17px;
+        }
+
+        .wb {
+          width: 26px;
+          height: 26px;
+        }
+
+        .sep {
+          margin: 0 3px;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <canvas id="base"></canvas>
+    <canvas id="live"></canvas>
+    <canvas id="cur"></canvas>
+    <textarea id="ti" rows="1" spellcheck="false"></textarea>
+
+    <nav id="bar">
+      <button class="tb on" id="btn-pen" title="Pen (P)">
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.75"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+        </svg>
+      </button>
+      <button class="tb" id="btn-text" title="Text (T)">
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.75"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <polyline points="4 7 4 4 20 4 20 7" />
+          <line x1="9" y1="20" x2="15" y2="20" />
+          <line x1="12" y1="4" x2="12" y2="20" />
+        </svg>
+      </button>
+      <button class="tb" id="btn-eraser" title="Eraser (E)">
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.75"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M20 20H7L3 16l13-13 6 6-2 11z" />
+          <line x1="6" y1="14" x2="14" y2="6" />
+        </svg>
+      </button>
+
+      <div class="sep"></div>
+
+      <button class="tb" id="btn-undo" title="Undo ⌘Z">
+        <svg
+          width="15"
+          height="15"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.75"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <polyline points="9 14 4 9 9 4" />
+          <path d="M20 20v-7a4 4 0 0 0-4-4H4" />
+        </svg>
+      </button>
+      <button class="tb" id="btn-redo" title="Redo ⌘⇧Z">
+        <svg
+          width="15"
+          height="15"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.75"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <polyline points="15 14 20 9 15 4" />
+          <path d="M4 20v-7a4 4 0 0 1 4-4h12" />
+        </svg>
+      </button>
+
+      <div class="sep"></div>
+
+      <button
+        class="cb on"
+        style="background: var(--c0)"
+        title="Charcoal"
+      ></button>
+      <button
+        class="cb"
+        style="background: var(--c1)"
+        title="Terra Rose"
+      ></button>
+      <button class="cb" style="background: var(--c2)" title="Sage"></button>
+      <button
+        class="cb"
+        style="background: var(--c3)"
+        title="Stone Blue"
+      ></button>
+      <button
+        class="cb"
+        style="background: var(--c4)"
+        title="Warm Sand"
+      ></button>
+      <button
+        class="cb"
+        style="background: var(--c5)"
+        title="Lavender Gray"
+      ></button>
+
+      <div class="sep"></div>
+
+      <button class="wb on" data-wi="0" title="Thin">
+        <span class="dot" style="width: 3px; height: 3px"></span>
+      </button>
+      <button class="wb" data-wi="1" title="Medium">
+        <span class="dot" style="width: 8px; height: 8px"></span>
+      </button>
+      <button class="wb" data-wi="2" title="Thick">
+        <span class="dot" style="width: 14px; height: 14px"></span>
+      </button>
+
+      <div class="sep"></div>
+
+      <button class="tb" id="btn-save" title="Save current view as link">
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.75"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path
+            d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"
+          />
+          <path
+            d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"
+          />
+        </svg>
+      </button>
+      <button
+        class="tb"
+        id="btn-download"
+        title="Download current view as standalone HTML"
+      >
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.75"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M12 3v12" />
+          <path d="m7 10 5 5 5-5" />
+          <path d="M5 21h14" />
+        </svg>
+      </button>
+    </nav>
+
+    <button id="zoom-hud" title="Reset view (0)">100%</button>
+    <div id="toast"></div>
+
+    <script>
+      (() => {
+        const downloadButton = document.getElementById("btn-download");
+        const saveButton = document.getElementById("btn-save");
+        const toastElement = document.getElementById("toast");
+
+        if (!downloadButton || !saveButton || !toastElement) {
+          return;
+        }
+
+        const waitForSave = async () => {
+          for (let attempt = 0; attempt < 120; attempt++) {
+            if (!saveButton.disabled) {
+              return;
+            }
+
+            await new Promise((resolve) => requestAnimationFrame(resolve));
+          }
+        };
+
+        const showToastMessage = (message) => {
+          toastElement.textContent = message;
+          toastElement.classList.add("show");
+          clearTimeout(showToastMessage.timer);
+          showToastMessage.timer = setTimeout(
+            () => toastElement.classList.remove("show"),
+            3000,
+          );
+        };
+
+        const buildExportFileName = () => {
+          const now = new Date();
+          const pad = (value) => String(value).padStart(2, "0");
+          const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+
+          return `DollyNote_export-${timestamp}.html`;
+        };
+
+        const buildExportHtml = (hash) => {
+          const exportedDocument = document.documentElement.cloneNode(true);
+          const exportedDownloadButton =
+            exportedDocument.querySelector("#btn-download");
+          const previousBootstraps = exportedDocument.querySelectorAll(
+            "script[data-export-bootstrap]",
+          );
+          const bootstrap = `<script data-export-bootstrap="1">if(!location.hash){history.replaceState(null,"","#${hash}")}<\/script>`;
+
+          previousBootstraps.forEach((node) => node.remove());
+
+          if (exportedDownloadButton) {
+            exportedDownloadButton.disabled = false;
+            exportedDownloadButton.style.opacity = "";
+          }
+
+          const html = `<!DOCTYPE html>\n${exportedDocument.outerHTML}`;
+          const exportedHtml = html.replace(
+            /<script\s+type="module"/i,
+            `${bootstrap}<script type="module"`,
+          );
+
+          if (exportedHtml === html) {
+            throw new Error("Missing bootstrap anchor");
+          }
+
+          return exportedHtml;
+        };
+
+        downloadButton.title = "Download current view as standalone HTML";
+
+        downloadButton.addEventListener("click", async () => {
+          downloadButton.disabled = true;
+          downloadButton.style.opacity = ".25";
+
+          try {
+            saveButton.click();
+            await waitForSave();
+
+            const hash = location.hash.slice(1);
+            if (!hash) {
+              throw new Error("Missing hash");
+            }
+
+            const exportHtml = buildExportHtml(hash);
+            const blob = new Blob([exportHtml], {
+              type: "text/html;charset=utf-8",
+            });
+            const url = URL.createObjectURL(blob);
+            const downloadLink = document.createElement("a");
+
+            downloadLink.href = url;
+            downloadLink.download = buildExportFileName();
+            document.body.appendChild(downloadLink);
+            downloadLink.click();
+            downloadLink.remove();
+            URL.revokeObjectURL(url);
+
+            showToastMessage("HTML downloaded");
+          } catch {
+            showToastMessage("Download failed");
+          } finally {
+            downloadButton.disabled = false;
+            downloadButton.style.opacity = "";
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>
