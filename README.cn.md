@@ -25,7 +25,7 @@ DollyNote 会把当前绘图内容和视口状态编码进页面的 hash。
 
 ## 使用方式
 
-1. 在浏览器中打开 [index.html](index.html)。
+1. 在浏览器中打开 [dolly-note.prod.html](dolly-note.prod.html)。
 2. 使用画笔绘图、插入文字，或者擦除内容。
 3. 通过拖拽、滚轮或触控手势在画布中移动。
 4. 点击保存，把包含当前状态的分享链接写入 URL 并复制出去。
@@ -46,7 +46,7 @@ DollyNote 会把当前绘图内容和视口状态编码进页面的 hash。
 
 ## 项目结构
 
-- [index.html](index.html)：完整应用入口，包含界面、渲染、状态编码、恢复逻辑，以及独立 HTML 导出能力
+- [dolly-note.prod.html](dolly-note.prod.html)：完整应用入口，包含界面、渲染、状态编码、恢复逻辑，以及独立 HTML 导出能力
 
 ## 说明
 
