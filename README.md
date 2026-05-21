@@ -25,7 +25,7 @@ When you click the download button, DollyNote generates a new HTML file based on
 
 ## Usage
 
-1. Open [index.html](index.html) in a browser.
+1. Open [dolly-note.prod.html](dolly-note.prod.html) in a browser.
 2. Draw with the pen tool, add text, or erase content.
 3. Use drag, wheel, or gesture controls to move around the canvas.
 4. Click save to copy a shareable link with the current state in the URL.
@@ -46,7 +46,7 @@ When you click the download button, DollyNote generates a new HTML file based on
 
 ## Project Structure
 
-- [index.html](index.html): the full application, including UI, rendering, state encoding, restore logic, and standalone HTML export
+- [dolly-note.prod.html](dolly-note.prod.html): the full application, including UI, rendering, state encoding, restore logic, and standalone HTML export
 
 ## Notes
 
